@@ -205,3 +205,42 @@ async def upload_excel(
     except Exception as e:
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+# api synchronization
+@app.post("/api/auto_sync")
+async def auto_sync_excel(file: UploadFile = File(...)):
+    try:
+        # 1. Simpan file tembakan dari ekstensi sementara
+        temp_filename = f"temp_sync_{int(datetime.now().timestamp())}_{file.filename}"
+        with open(temp_filename, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # 2. Bersihkan (Pangkas NIK) dan simpan permanen ke database_bersih.xlsx
+        sanitize_and_save_excel(temp_filename, RAW_FILE)
+        if os.path.exists(temp_filename): 
+            os.remove(temp_filename)
+
+        # 3. Ambil pengaturan visual terakhir yang dibuat Admin (Warna, Nama Penyakit, dll)
+        config_data = DEFAULT_DATA
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                config_data = json.load(f)
+
+        diseases_config = config_data.get("diseases_config", [])
+
+        # 4. Proses data Excel yang baru masuk menggunakan pengaturan Admin yang lama
+        parsed_data = process_excel_file(RAW_FILE, diseases_config)
+        
+        # Kembalikan metadata lama
+        parsed_data["metadata"] = config_data.get("metadata", DEFAULT_DATA["metadata"])
+        parsed_data["metadata"]["tanggal_update"] = datetime.now().strftime("%d %b %Y %H:%M") # Update jam sinkronisasi
+        parsed_data["diseases_config"] = diseases_config
+
+        # 5. Simpan pembaruan ke JSON
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(parsed_data, f, indent=2)
+
+        return JSONResponse(content={"status": "success", "message": "Sinkronisasi otomatis berhasil"})
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
