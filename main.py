@@ -1,6 +1,8 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Security, Header
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 from typing import Optional
 import pandas as pd
 import json
@@ -8,7 +10,9 @@ import os
 import shutil
 import re
 import traceback
-from datetime import datetime
+import hashlib
+from datetime import datetime, timedelta, timezone
+import jwt
 
 app = FastAPI(title="Dashboard Surveilans API")
 
@@ -22,6 +26,51 @@ app.add_middleware(
 
 DATA_FILE = "dashboard_data.json"
 RAW_FILE = "database_bersih.xlsx"
+
+# Konfigurasi Keamanan JWT & Kredensial Admin
+JWT_SECRET = os.getenv("JWT_SECRET", "surveilans-puskesmas-jwt-secret-key-2026")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_HOURS = 24
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD_HASH = os.getenv(
+    "ADMIN_PASSWORD_HASH",
+    hashlib.sha256("admin123".encode()).hexdigest()
+)
+API_SYNC_KEY = os.getenv("API_SYNC_KEY", "sync-secret-surveilans-2026")
+
+security = HTTPBearer(auto_error=False)
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def create_access_token(username: str, role: str = "admin") -> str:
+    expire = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
+    payload = {
+        "sub": username,
+        "role": role,
+        "exp": expire,
+        "iat": datetime.now(timezone.utc)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def get_current_admin(credentials: Optional[HTTPAuthorizationCredentials] = Security(security)):
+    """Middleware proteksi endpoint: Memeriksa validitas Bearer Token JWT"""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Akses ditolak: Token autentikasi tidak ditemukan.")
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("role") != "admin":
+            raise HTTPException(status_code=403, detail="Akses ditolak: Hak akses tidak memadai.")
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Sesi login telah berakhir. Silakan login kembali.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Token autentikasi tidak valid.")
 
 DEFAULT_DATA = {
     "metadata": {
@@ -202,11 +251,44 @@ def ensure_dashboard_cache():
 # Jalankan inisialisasi cache saat startup
 ensure_dashboard_cache()
 
+# ==============================================================
+# ENDPOINT AUTENTIKASI PETUGAS
+# ==============================================================
+@app.post("/api/auth/login")
+def login_petugas(req: LoginRequest):
+    """
+    Endpoint Login Resmi: Memvalidasi username & password di server,
+    lalu mengembalikan JSON Web Token (JWT) yang aman.
+    """
+    if req.username == ADMIN_USERNAME and hash_password(req.password) == ADMIN_PASSWORD_HASH:
+        token = create_access_token(req.username, role="admin")
+        return {
+            "status": "success",
+            "token": token,
+            "username": req.username,
+            "role": "admin",
+            "expires_in": JWT_EXPIRE_HOURS * 3600
+        }
+    raise HTTPException(status_code=401, detail="Nama pengguna atau kata sandi tidak valid.")
+
+@app.get("/api/auth/verify")
+def verify_session(current_user: dict = Depends(get_current_admin)):
+    """Memverifikasi keabsahan sesi login saat ini"""
+    return {
+        "status": "success",
+        "valid": True,
+        "username": current_user.get("sub"),
+        "role": current_user.get("role")
+    }
+
+# ==============================================================
+# ENDPOINT PUBLIK
+# ==============================================================
 @app.get("/api/dashboard")
 def get_dashboard_data(puskesmas: Optional[str] = None):
     """
-    Endpoint dashboard cepat: Hanya membaca file JSON cache tanpa menyentuh file Excel.
-    Jika filter puskesmas diminta, data langsung disaring dari JSON.
+    Endpoint dashboard publik: Membaca file JSON cache (sangat cepat, <5ms).
+    Tidak memerlukan autentikasi login (terbuka untuk publik).
     """
     config_data = DEFAULT_DATA
     if os.path.exists(DATA_FILE):
@@ -237,7 +319,9 @@ def get_dashboard_data(puskesmas: Optional[str] = None):
 
     return config_data
 
-# --- API UPLOAD TERPUSAT KEMBALI ---
+# ==============================================================
+# ENDPOINT ADMINISTRASI TERPROTEKSI (WAJIB BEARER TOKEN)
+# ==============================================================
 @app.post("/api/upload")
 async def upload_excel(
     file: Optional[UploadFile] = File(None),
@@ -245,7 +329,8 @@ async def upload_excel(
     sumber: str = Form("Rekam Medik Elektronik Puskesmas"),
     logo: str = Form("Hospital"),
     custom_logo: Optional[str] = Form(None),
-    diseases_config: str = Form(...) 
+    diseases_config: str = Form(...),
+    current_admin: dict = Depends(get_current_admin) # <-- HANYA BISA DIAKSES ADMIN DENGAN JWT SAH!
 ):
     try:
         config_list = json.loads(diseases_config)
@@ -285,9 +370,28 @@ async def upload_excel(
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
-# API sinkronisasi otomatis
+# API sinkronisasi otomatis (Terproteksi API Key atau Bearer Token)
 @app.post("/api/auto_sync")
-async def auto_sync_excel(file: UploadFile = File(...)):
+async def auto_sync_excel(
+    file: UploadFile = File(...),
+    x_api_key: Optional[str] = Header(None),
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(security)
+):
+    # Validasi autentikasi mesin-ke-mesin
+    authenticated = False
+    if x_api_key and x_api_key == API_SYNC_KEY:
+        authenticated = True
+    elif credentials:
+        try:
+            payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+            if payload.get("role") == "admin":
+                authenticated = True
+        except Exception:
+            pass
+
+    if not authenticated:
+        raise HTTPException(status_code=401, detail="Akses ditolak: API Key atau Token tidak valid.")
+
     try:
         # 1. Simpan file tembakan dari ekstensi sementara
         temp_filename = f"temp_sync_{int(datetime.now().timestamp())}_{file.filename}"
@@ -311,8 +415,9 @@ async def auto_sync_excel(file: UploadFile = File(...)):
         parsed_data = process_excel_file(RAW_FILE, diseases_config)
         
         # Pertahankan metadata lama
-        parsed_data["metadata"] = config_data.get("metadata", DEFAULT_DATA["metadata"])
-        parsed_data["metadata"]["tanggal_update"] = datetime.now().strftime("%d %b %Y %H:%M")
+        old_meta = config_data.get("metadata", DEFAULT_DATA["metadata"])
+        old_meta["tanggal_update"] = datetime.now().strftime("%d %b %Y %H:%M")
+        parsed_data["metadata"] = old_meta
         parsed_data["diseases_config"] = diseases_config
 
         # 5. Simpan pembaruan ke JSON cache
