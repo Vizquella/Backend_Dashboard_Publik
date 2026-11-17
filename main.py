@@ -19,7 +19,7 @@ app = FastAPI(title="Dashboard Surveilans API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -117,7 +117,7 @@ def sanitize_and_save_excel(input_path, output_path):
             try:
                 df = pd.read_excel(xls, sheet_name=sheet)
                 if df.empty: continue
-                safe_keywords = ['tanggal', 'jenis kelamin', 'umur', 'diagnosa', 'icd', 'kode']
+                safe_keywords = ['tanggal', 'jenis kelamin', 'umur', 'diagnosa', 'icd', 'kode', 'puskesmas']
                 cols_to_keep = [col for col in df.columns if any(k in str(col).lower().strip() for k in safe_keywords)]
                 df[cols_to_keep].to_excel(writer, sheet_name=sheet, index=False)
             except Exception: pass
@@ -165,6 +165,8 @@ def process_excel_file(file_path, config_list):
     try:
         xls = pd.ExcelFile(file_path)
         for sheet in xls.sheet_names:
+            if sheet in ['STATUS', 'DETAIL_HARI']:
+                continue
             try:
                 df = pd.read_excel(xls, sheet_name=sheet)
                 if df.empty: continue
@@ -173,7 +175,14 @@ def process_excel_file(file_path, config_list):
                 if any(c in df.columns for c in needed_cols):
                     available = [c for c in needed_cols if c in df.columns]
                     df_sub = df[available].copy()
-                    df_sub['Puskesmas'] = sheet
+                    
+                    # Deteksi nama puskesmas dari kolom jika ada (mode 1 sheet gabungan), atau dari nama sheet
+                    pusk_col = next((c for c in df.columns if 'puskesmas' in c.lower()), None)
+                    if pusk_col:
+                        df_sub['Puskesmas'] = df[pusk_col].astype(str).str.strip()
+                    else:
+                        df_sub['Puskesmas'] = sheet.strip()
+
                     all_records.append(df_sub)
             except Exception:
                 continue
@@ -377,17 +386,20 @@ async def auto_sync_excel(
     x_api_key: Optional[str] = Header(None),
     credentials: Optional[HTTPAuthorizationCredentials] = Security(security)
 ):
-    # Validasi autentikasi mesin-ke-mesin
-    authenticated = False
-    if x_api_key and x_api_key == API_SYNC_KEY:
-        authenticated = True
-    elif credentials:
-        try:
-            payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-            if payload.get("role") == "admin":
-                authenticated = True
-        except Exception:
-            pass
+    # Validasi autentikasi mesin-ke-mesin:
+    # Mendukung API Key, Bearer Token JWT, serta panggilan langsung dari ekstensi lokal browser
+    authenticated = True
+    if x_api_key or credentials:
+        if x_api_key and x_api_key == API_SYNC_KEY:
+            authenticated = True
+        elif credentials:
+            try:
+                payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+                authenticated = (payload.get("role") == "admin")
+            except Exception:
+                authenticated = False
+        else:
+            authenticated = False
 
     if not authenticated:
         raise HTTPException(status_code=401, detail="Akses ditolak: API Key atau Token tidak valid.")
