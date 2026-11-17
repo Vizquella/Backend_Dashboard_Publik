@@ -17,6 +17,10 @@ ENV/
 *.csv
 temp_*
 dashboard_data.json
+*.db
+*.sqlite
+*.sqlite3
+surveilans.db
 
 # 4. Environment & Credentials
 .env

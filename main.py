@@ -1,3 +1,4 @@
+import sqlite3
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Security, Header
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +27,7 @@ app.add_middleware(
 
 DATA_FILE = "dashboard_data.json"
 RAW_FILE = "database_bersih.xlsx"
+DB_FILE = "surveilans.db"
 
 # Konfigurasi Keamanan JWT & Kredensial Admin
 JWT_SECRET = os.getenv("JWT_SECRET", "surveilans-puskesmas-jwt-secret-key-2026")
@@ -40,37 +42,79 @@ API_SYNC_KEY = os.getenv("API_SYNC_KEY", "sync-secret-surveilans-2026")
 
 security = HTTPBearer(auto_error=False)
 
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
-def create_access_token(username: str, role: str = "admin") -> str:
+def init_db():
+    """Inisialisasi tabel basis data SQLite untuk pengguna masyarakat & petugas"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nama_lengkap TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT DEFAULT 'masyarakat',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login TIMESTAMP
+        )
+    """)
+    conn.commit()
+
+    # Pastikan akun administrator bawaan selalu tersedia
+    c.execute("SELECT id FROM users WHERE LOWER(email) = ? OR LOWER(email) = ?", ("admin", "admin@surveilans.go.id"))
+    if not c.fetchone():
+        now_str = datetime.now().strftime("%d %b %Y %H:%M")
+        c.execute("""
+            INSERT INTO users (nama_lengkap, email, password_hash, role, created_at, last_login)
+            VALUES (?, ?, ?, 'admin', ?, ?)
+        """, ("Administrator Sistem", "admin@surveilans.go.id", ADMIN_PASSWORD_HASH, now_str, now_str))
+        conn.commit()
+    conn.close()
+
+# Inisialisasi basis data
+init_db()
+
+class LoginRequest(BaseModel):
+    username: Optional[str] = None
+    email: Optional[str] = None
+    password: str
+
+class RegisterRequest(BaseModel):
+    nama_lengkap: str
+    email: str
+    password: str
+
+def create_access_token(identifier: str, role: str = "masyarakat", nama_lengkap: str = "") -> str:
     expire = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
     payload = {
-        "sub": username,
+        "sub": identifier,
         "role": role,
+        "nama_lengkap": nama_lengkap,
         "exp": expire,
         "iat": datetime.now(timezone.utc)
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-def get_current_admin(credentials: Optional[HTTPAuthorizationCredentials] = Security(security)):
-    """Middleware proteksi endpoint: Memeriksa validitas Bearer Token JWT"""
+def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Security(security)):
+    """Middleware proteksi endpoint: Memeriksa validitas token untuk semua pengguna (masyarakat & admin)"""
     if not credentials:
         raise HTTPException(status_code=401, detail="Akses ditolak: Token autentikasi tidak ditemukan.")
     token = credentials.credentials
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        if payload.get("role") != "admin":
-            raise HTTPException(status_code=403, detail="Akses ditolak: Hak akses tidak memadai.")
         return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Sesi login telah berakhir. Silakan login kembali.")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Token autentikasi tidak valid.")
+
+def get_current_admin(current_user: dict = Depends(get_current_user)):
+    """Middleware proteksi khusus administrator"""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Akses ditolak: Hak akses administrator diperlukan.")
+    return current_user
 
 DEFAULT_DATA = {
     "metadata": {
@@ -261,33 +305,175 @@ def ensure_dashboard_cache():
 ensure_dashboard_cache()
 
 # ==============================================================
-# ENDPOINT AUTENTIKASI PETUGAS
+# ENDPOINT AUTENTIKASI SATU PINTU (UNIFIED LOGIN & REGISTER)
 # ==============================================================
-@app.post("/api/auth/login")
-def login_petugas(req: LoginRequest):
-    """
-    Endpoint Login Resmi: Memvalidasi username & password di server,
-    lalu mengembalikan JSON Web Token (JWT) yang aman.
-    """
-    if req.username == ADMIN_USERNAME and hash_password(req.password) == ADMIN_PASSWORD_HASH:
-        token = create_access_token(req.username, role="admin")
-        return {
-            "status": "success",
-            "token": token,
-            "username": req.username,
-            "role": "admin",
-            "expires_in": JWT_EXPIRE_HOURS * 3600
+@app.post("/api/auth/register")
+def register_user(req: RegisterRequest):
+    """Pendaftaran mandiri akun masyarakat untuk pemantauan akses dashboard"""
+    nama = req.nama_lengkap.strip()
+    email = req.email.strip().lower()
+    pwd = req.password
+
+    if not nama or not email or not pwd:
+        raise HTTPException(status_code=400, detail="Nama lengkap, email, dan kata sandi wajib diisi.")
+    
+    if len(pwd) < 6:
+        raise HTTPException(status_code=400, detail="Kata sandi minimal 6 karakter demi keamanan.")
+    
+    if "@" not in email or "." not in email:
+        raise HTTPException(status_code=400, detail="Format alamat email tidak valid.")
+
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    c.execute("SELECT id FROM users WHERE LOWER(email) = ?", (email,))
+    if c.fetchone():
+        conn.close()
+        raise HTTPException(status_code=400, detail="Alamat email sudah terdaftar. Silakan langsung masuk.")
+
+    hashed_pwd = hash_password(pwd)
+    now_str = datetime.now().strftime("%d %b %Y %H:%M")
+
+    c.execute("""
+        INSERT INTO users (nama_lengkap, email, password_hash, role, created_at, last_login)
+        VALUES (?, ?, ?, 'masyarakat', ?, ?)
+    """, (nama, email, hashed_pwd, now_str, now_str))
+    new_id = c.lastrowid
+    conn.commit()
+    conn.close()
+
+    token = create_access_token(email, role="masyarakat", nama_lengkap=nama)
+    return {
+        "status": "success",
+        "message": "Pendaftaran berhasil",
+        "token": token,
+        "role": "masyarakat",
+        "user": {
+            "id": new_id,
+            "nama_lengkap": nama,
+            "email": email,
+            "role": "masyarakat"
         }
-    raise HTTPException(status_code=401, detail="Nama pengguna atau kata sandi tidak valid.")
+    }
+
+@app.post("/api/auth/login")
+def login(req: LoginRequest):
+    """
+    Satu Pintu Masuk (Unified Login):
+    Dapat digunakan masyarakat (email) maupun administrator (email / 'admin').
+    """
+    ident = (req.email or req.username or "").strip().lower()
+    if not ident or not req.password:
+        raise HTTPException(status_code=400, detail="Identitas dan kata sandi wajib diisi.")
+
+    hashed_input = hash_password(req.password)
+    
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    # Cek khusus untuk kredensial administrator (bisa username 'admin' atau email)
+    if ident == "admin" or ident == "admin@surveilans.go.id":
+        if hashed_input == ADMIN_PASSWORD_HASH:
+            c.execute("SELECT * FROM users WHERE LOWER(email) = ? OR LOWER(email) = ?", ("admin@surveilans.go.id", "admin"))
+            user = c.fetchone()
+            now_str = datetime.now().strftime("%d %b %Y %H:%M")
+            if user:
+                c.execute("UPDATE users SET last_login = ? WHERE id = ?", (now_str, user["id"]))
+                conn.commit()
+                nama = user["nama_lengkap"]
+                email_val = user["email"]
+            else:
+                nama = "Administrator Sistem"
+                email_val = "admin@surveilans.go.id"
+            conn.close()
+
+            token = create_access_token(email_val, role="admin", nama_lengkap=nama)
+            return {
+                "status": "success",
+                "token": token,
+                "role": "admin",
+                "user": {
+                    "nama_lengkap": nama,
+                    "email": email_val,
+                    "role": "admin"
+                }
+            }
+        else:
+            conn.close()
+            raise HTTPException(status_code=401, detail="Kata sandi administrator salah.")
+
+    # Cek pengguna reguler di database SQLite
+    c.execute("SELECT * FROM users WHERE LOWER(email) = ?", (ident,))
+    user = c.fetchone()
+
+    if not user:
+        conn.close()
+        raise HTTPException(status_code=401, detail="Akun dengan email tersebut belum terdaftar.")
+
+    if user["password_hash"] != hashed_input:
+        conn.close()
+        raise HTTPException(status_code=401, detail="Kata sandi salah. Silakan periksa kembali.")
+
+    now_str = datetime.now().strftime("%d %b %Y %H:%M")
+    c.execute("UPDATE users SET last_login = ? WHERE id = ?", (now_str, user["id"]))
+    conn.commit()
+    conn.close()
+
+    token = create_access_token(user["email"], role=user["role"], nama_lengkap=user["nama_lengkap"])
+    return {
+        "status": "success",
+        "token": token,
+        "role": user["role"],
+        "user": {
+            "id": user["id"],
+            "nama_lengkap": user["nama_lengkap"],
+            "email": user["email"],
+            "role": user["role"]
+        }
+    }
 
 @app.get("/api/auth/verify")
-def verify_session(current_user: dict = Depends(get_current_admin)):
-    """Memverifikasi keabsahan sesi login saat ini"""
+def verify_session(current_user: dict = Depends(get_current_user)):
+    """Memverifikasi keabsahan sesi login saat ini (masyarakat atau admin)"""
     return {
         "status": "success",
         "valid": True,
-        "username": current_user.get("sub"),
-        "role": current_user.get("role")
+        "user": {
+            "email": current_user.get("sub"),
+            "role": current_user.get("role"),
+            "nama_lengkap": current_user.get("nama_lengkap", "")
+        }
+    }
+
+# ==============================================================
+# ENDPOINT ADMINISTRASI PENGGUNA (TERPROTEKSI ADMIN)
+# ==============================================================
+@app.get("/api/admin/users")
+def get_all_users(admin: dict = Depends(get_current_admin)):
+    """Mengambil daftar seluruh akun yang telah terdaftar pada sistem (Hanya Admin)"""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("""
+        SELECT id, nama_lengkap, email, role, created_at, last_login 
+        FROM users 
+        ORDER BY id DESC
+    """)
+    rows = c.fetchall()
+    conn.close()
+
+    users_list = [dict(r) for r in rows]
+    total_masyarakat = sum(1 for u in users_list if u.get("role") == "masyarakat")
+    total_admin = sum(1 for u in users_list if u.get("role") == "admin")
+
+    return {
+        "status": "success",
+        "total_users": len(users_list),
+        "total_masyarakat": total_masyarakat,
+        "total_admin": total_admin,
+        "users": users_list
     }
 
 # ==============================================================
